@@ -1,0 +1,242 @@
+ខ្ញុំចង់ធ្វើ ដូចជា ៖
+
+ឧទាហរណ៍ កាហ្វេកែបតូចមួយ មានគ្រៀងផ្សំដូច ជា ទឹកកក 1 កែវ , ទឹកដោះគោ 5 ml , ស្ករ 5 g ,ហើយកាហ្វេកែវធំមួយ មានគ្រៀងផ្សំដូច ជា ទឹកកក 1 កែវ , ទឹកដោះគោ 7 ml , ស្ករ 7 g 
+
+ចឹងនៅពេលដែលភ្ញៀវធ្វើការកម្មង់ កាហ្វេ កែវតូចមួយ យក់ស្ក 50% នោះសូមឲ្យវាយក 50% ទៅគិតជាមួយចំនួនស្ក ពេញក្នុង មួយកែវតូចហើយបានទៅដក់ ចំនួយនស្ក,ទឹកដោះគោ,ទឹកកក,ចេញ ពី Ingredients
+
+
+
+namespace App\Http\Controllers;
+
+use App\Models\Order;
+use App\Models\OrderDetail;
+use App\Models\CoffeeIngredient; // ហៅ Model របស់ Coffee Ingredients
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+class OrderController extends Controller
+{
+    public function store(Request $request)
+    {
+        // ១. Validate ទិន្នន័យ
+        $request->validate([
+            'customer_id' => 'required|exists:customers,id',
+            'user_id' => 'required|exists:users,id',
+            'order_mode' => 'required|exists:order_modes,id',
+            'exchange' => 'required|exists:exchanges,id',
+            'order_number' => 'required|string',
+            'discound' => 'nullable|integer',
+            'tax' => 'nullable|numeric',
+            'order_at' => 'required|date',
+            'status' => 'nullable|integer',
+
+            'items' => 'required|array|min:1',
+            'items.*.coffee_variant_id' => 'required|exists:coffee_variants,id',
+            'items.*.sugar_percent' => 'nullable|numeric|min:0|max:100', // ភាគរយស្ករ ឧទាហរណ៍ 50, 100
+            'items.*.quantity' => 'required|integer|min:1',
+            'items.*.unit_price' => 'required|numeric|min:0',
+        ]);
+
+        return DB::transaction(function () use ($request) {
+
+            $subTotal = 0;
+
+            // ២. គណនា SubTotal
+            foreach ($request->items as $item) {
+                $subTotal += $item['quantity'] * $item['unit_price'];
+            }
+
+            $discount = $request->discound ?? 0;
+            $tax = $request->tax ?? 0;
+            $totalAmount = ($subTotal - $discount) + $tax;
+
+            // ៣. បង្កើត Order
+            $order = Order::create([
+                'CustomerId' => $request->customer_id,
+                'UserId' => $request->user_id,
+                'OrderModelId' => $request->order_mode,
+                'exchange' => $request->exchange,
+                'OrderNumber' => $request->order_number,
+                'SubTotal' => $subTotal,
+                'Discound' => $discount,
+                'Tax' => $tax,
+                'TotalAmount' => $totalAmount,
+                'OrderAt' => $request->order_at,
+                'Status' => $request->status ?? 1,
+            ]);
+
+            // ៤. បង្កើត Order Detail និងធ្វើការកាត់ស្តុកគ្រឿងផ្សំ (Ingredients)
+            foreach ($request->items as $item) {
+                $coffeeVariantId = $item['coffee_variant_id'];
+                $orderQty = $item['quantity']; // ចំនួនកែវដែលកុម្ម៉ង់ (ឧ៖ ១កែវ ឬ ២កែវ)
+                $sugarPercent = isset($item['sugar_percent']) ? (float)$item['sugar_percent'] : 100; // បើអត់បញ្ជាក់ គឺយក 100%
+
+                $itemSubTotal = $orderQty * $item['unit_price'];
+
+                OrderDetail::create([
+                    'OrderId' => $order->id,
+                    'CoffeeVariantId' => $coffeeVariantId,
+                    'sugar_percent' => $sugarPercent,
+                    'Quantity' => $orderQty,
+                    'UnitPrice' => $item['unit_price'],
+                    'SubTotal' => $itemSubTotal,
+                ]);
+
+                // --- ផ្នែកកាត់ស្តុកគ្រឿងផ្សំ (Stock Deduction Logic) ---
+                // ទាញយកគ្រឿងផ្សំទាំងអស់ដែលផ្សំឡើងសម្រាប់ Coffee Variant នេះ
+                $coffeeIngredients = CoffeeIngredient::where('CoffeeVariantId', $coffeeVariantId)->with('ingredient')->get();
+
+                foreach ($coffeeIngredients as $ci) {
+                    $ingredient = $ci->ingredient; // Model របស់តារាង Ingredients
+                    $baseQuantity = $ci->Quantity; // បរិមាណស្តង់ដារក្នុង ១ កែវ (ឧ៖ ស្ករ 5g, ទឹកដោះគោ 5ml)
+
+                    $multiplier = 1;
+
+                    // ពិនិត្យមើលថាតើគ្រឿងផ្សំនេះជា "ស្ករ" ដែរឬទេ (ឆែកតាមឈ្មោះក្នុង Table Ingredients)
+                    if ($ingredient && (stripos($ingredient->Name, 'sugar') !== false || stripos($ingredient->Name, 'ស្ករ') !== false)) {
+                        // ប្រសិនបើជាស្ករ ត្រូវយកភាគរយមកគណនា (ឧ៖ 50% គឺ 50 / 100 = 0.5)
+                        $multiplier = $sugarPercent / 100;
+                    }
+
+                    // រូបមន្តគណរបរិមាណសរុបដែលត្រូវកាត់ចេញ៖
+                    // (បរិមាណស្តង់ដារក្នុង ១កែវ * ភាគរយស្ករ) * ចំនួនកែវដែលកុម្ម៉ង់
+                    $totalDeduction = ($baseQuantity * $multiplier) * $orderQty;
+
+                    // កាត់បន្ថយស្តុកក្នុងតារាង Ingredients តាមរយៈ StockQuantity
+                    if ($ingredient) {
+                        $ingredient->decrement('StockQuantity', $totalDeduction);
+                    }
+                }
+            }
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $order->load('details'),
+                'message' => 'Order created and stock deducted successfully'
+            ], 201);
+        });
+    }
+}
+
+
+
+
+
+
+namespace App\Http\Controllers;
+
+use App\Models\Order;
+use App\Models\OrderDetail;
+use App\Models\CoffeeIngredient;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+class OrderController extends Controller
+{
+    public function store(Request $request)
+    {
+        // ១. Validate ទិន្នន័យ
+        $request->validate([
+            'customer_id' => 'required|exists:customers,id',
+            'user_id' => 'required|exists:users,id',
+            'order_mode' => 'required|exists:order_modes,id',
+            'exchange' => 'required|exists:exchanges,id',
+            'order_number' => 'required|string',
+            'discound' => 'nullable|integer',
+            'tax' => 'nullable|numeric',
+            'order_at' => 'required|date',
+            'status' => 'nullable|integer',
+
+            'items' => 'required|array|min:1',
+            'items.*.coffee_variant_id' => 'required|exists:coffee_variants,id',
+            'items.*.sugar_percent' => 'nullable|numeric|min:0|max:100', // ភាគរយស្ករ ឧទាហរណ៍ 50, 100
+            'items.*.quantity' => 'required|integer|min:1',
+            'items.*.unit_price' => 'required|numeric|min:0',
+        ]);
+
+        return DB::transaction(function () use ($request) {
+
+            $subTotal = 0;
+
+            // ២. គណនា SubTotal
+            foreach ($request->items as $item) {
+                $subTotal += $item['quantity'] * $item['unit_price'];
+            }
+
+            $discount = $request->discound ?? 0;
+            $tax = $request->tax ?? 0;
+            $totalAmount = ($subTotal - $discount) + $tax;
+
+            // ៣. បង្កើត Order
+            $order = Order::create([
+                'CustomerId' => $request->customer_id,
+                'UserId' => $request->user_id,
+                'OrderModelId' => $request->order_mode,
+                'exchange' => $request->exchange,
+                'OrderNumber' => $request->order_number,
+                'SubTotal' => $subTotal,
+                'Discound' => $discount,
+                'Tax' => $tax,
+                'TotalAmount' => $totalAmount,
+                'OrderAt' => $request->order_at,
+                'Status' => $request->status ?? 1,
+            ]);
+
+            // ៤. បង្កើត Order Detail និងធ្វើការកាត់ស្តុកគ្រឿងផ្សំ (Ingredients)
+            foreach ($request->items as $item) {
+                $coffeeVariantId = $item['coffee_variant_id'];
+                $orderQty = $item['quantity']; // ចំនួនកែវដែលកុម្ម៉ង់
+                $sugarPercent = isset($item['sugar_percent']) ? (float)$item['sugar_percent'] : 100; // បើអត់បញ្ជាក់ យក 100%
+
+                $itemSubTotal = $orderQty * $item['unit_price'];
+
+                OrderDetail::create([
+                    'OrderId' => $order->id,
+                    'CoffeeVariantId' => $coffeeVariantId,
+                    'sugar_percent' => $sugarPercent,
+                    'Quantity' => $orderQty,
+                    'UnitPrice' => $item['unit_price'],
+                    'SubTotal' => $itemSubTotal,
+                ]);
+
+                // --- ផ្នែកកាត់ស្តុកគ្រឿងផ្សំ (Stock Deduction Logic) ---
+                // ទាញយកគ្រឿងផ្សំទាំងអស់ដែលបានកំណត់សម្រាប់ Coffee Variant នេះ (មិនថា ទឹកដោះគោ, ទឹកកក, ស្ករ,...)
+                $coffeeIngredients = CoffeeIngredient::where('CoffeeVariantId', $coffeeVariantId)->with('ingredient')->get();
+
+                foreach ($coffeeIngredients as $ci) {
+                    $ingredient = $ci->ingredient; // Model របស់តារាង Ingredients
+                    $baseQuantity = $ci->Quantity; // បរិមាណស្តង់ដារក្នុង ១ កែវ (តាម Size តូច ឬធំដែលបានកំណត់ទុក)
+
+                    $multiplier = 1;
+
+                    // ពិនិត្យមើលថាតើគ្រឿងផ្សំនេះជា "ស្ករ" ដែរឬទេ (ឆែកទាំងភាសាអង់គ្លេស និងខ្មែរ)
+                    if ($ingredient) {
+                        $nameLower = mb_strtolower($ingredient->Name);
+                        if (
+                            strpos($nameLower, 'sugar') !== false ||
+                            strpos($nameLower, 'ស្ករ') !== false
+                        ) {
+                            // ប្រសិនបើជាស្ករ យកភាគរយមកគណនា (ឧ៖ 50% គឺ 50 / 100 = 0.5)
+                            $multiplier = $sugarPercent / 100;
+                        }
+                    }
+
+                    // រូបមន្តគណនាបរិមាណសរុបដែលត្រូវកាត់ចេញ៖
+                    // (បរិមាណស្តង់ដារក្នុង ១កែវ * ភាគរយស្ករ) * ចំនួនកែវដែលកុម្ម៉ង់
+                    $totalDeduction = ($baseQuantity * $multiplier) * $orderQty;
+
+                    // កាត់បន្ថយស្តុកក្នុងតារាង Ingredients តាមរយៈ StockQuantity
+                    if ($ingredient) {
+                        $ingredient->decrement('StockQuantity', $totalDeduction);
+                    }
+                }
+            }
+
+            return response()->json([
+                'status' => 'success',
+                'data' => $order->load('details'),
+                'message' => 'Order created and stock deducted successfully'
+            ], 201);
+        });
+    }
+}
